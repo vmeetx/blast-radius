@@ -78,7 +78,7 @@ class Chooser:
             parts = strict_diff.sections(patch)
         except strict_diff.Unreadable as problem:
             raise Everything(problem) from None
-        chosen, near = set(self.unknown), set()
+        chosen, near, self.coarse, programs = set(self.unknown), set(), {}, {}
         for path, hunks in parts:
             name = path.rsplit("/", 1)[-1]
             if name in SETTINGS or name.endswith(".pth") or path == "setup.py" or path not in self.record.index["files"]:
@@ -97,9 +97,14 @@ class Chooser:
             if facts["always"] or b"\0" in new:
                 raise Everything(f"{path}: {facts['always'] or 'binary'}")
             near |= self.numbers(facts["loaded"])
-            chosen |= self.numbers(facts["opened"])
             if name.endswith(".py"):
+                programs[path] = (old, new)
                 chosen |= self.python(path, new, facts)
+            if path in self.coarse:
+                self.coarse[path] |= self.numbers(facts["opened"])
+            else:
+                chosen |= self.numbers(facts["opened"])
+        chosen |= self.narrowed(programs)
         return chosen, near - chosen
 
     def python(self, path, new, facts):
@@ -116,7 +121,8 @@ class Chooser:
             differing = codes.changed(before, after)
         except codes.NeedLoadRule:
             # what runs at import reaches a test through the module: only tests that load it
-            return self.numbers(facts["narrow"]) | numbered | untraced
+            self.coarse[path] = self.numbers(facts["narrow"])
+            return numbered | untraced
         if not differing:
             return numbered
         ran = numbered | untraced
@@ -129,6 +135,18 @@ class Chooser:
                 return loaders
             ran = ran | self.numbers(mask)
         return ran
+
+    def narrowed(self, programs):
+        """The tests of the files that fell to the load rule, fewer where only requirement flags were flipped."""
+        wanted = set()
+        if self.coarse:
+            import requirement_flags
+
+            gate = requirement_flags.Gate(self.record, programs)
+            for path, loaders in self.coarse.items():
+                mask = gate.observers(path)
+                wanted |= loaders if mask is None else loaders & self.numbers(format(mask, "x"))
+        return wanted
 
     def keeps_state(self, tree, code):
         """Does the new version of this outermost body write state that outlives a call?"""

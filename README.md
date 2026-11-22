@@ -71,13 +71,14 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 
 ## This entry
 
-`selector.py` reads a map in `map/` and answers from it. Nothing from the patches is executed. The map was recorded once at the pinned commit, in the base image with `requirements.lock`, by the programs in `build/` (`MAP_ORIGIN.json` says with what). It holds, for every test, the code objects it ran, the files it opened and the modules its test file loads.
+`selector.py` reads a map in `map/` and answers from it. Nothing from the patches is executed, except that a patch which may only flip requirement flags is imported in a forked process (next list). The map was recorded once at the pinned commit, in the base image with `requirements.lock`, by the programs in `build/` (`MAP_ORIGIN.json` says with what). It holds, for every test, the code objects it ran, the files it opened and the modules its test file loads.
 
 A test is left out only if its record shows that the change played no part in it:
 
 - Two versions of a Python file are compiled and compared code object by code object, line numbers aside. If only bodies that run when called differ, the tests that ran them are chosen.
 - If module- or class-level code differs, the tests that load the module are chosen: all tests of a file that loads it while it is collected, otherwise the tests that load it themselves, and every test that looks through the registry of dialects. A changed body that writes such state, and a file that no longer compiles, choose every test of every test file that loads the module.
+- If the only change to a module is true/false flags of `arg_types` entries of expression classes, the package is imported with the whole patch, from the map, in a forked process with its output closed. The classes whose required arguments then differ are known, and of the tests above only those are chosen that validated such a class without that argument, or that read the file. `build/gap_facts.py` records those gaps under two hash seeds, and `app/requirement_flags.py` refuses whenever anything else differs.
 - A changed data file chooses the tests that opened it. A test file chooses its own tests.
 - Added, deleted and renamed files, settings, binary files, anything the map does not cover and any patch that does not apply exactly run every test.
 
-`app/state.py` decides what writes lasting state and errs towards yes. To rebuild the map, build `build/Dockerfile`, run `build/gather.py` in it (modes `fork`, `order` and `reverse`), then `build/pack_map_pieces.py`.
+`app/state.py` decides what writes lasting state and errs towards yes. To rebuild the map, build `build/Dockerfile`, run `build/gather.py` in it (modes `fork`, `order` and `reverse`), then `build/pack_map_pieces.py`, then `build/pack_gaps.py` with the fork passes of hash seeds 0 and 1.
