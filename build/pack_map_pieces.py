@@ -116,7 +116,7 @@ def looks_through(path, code):
     return bool(REGISTRY & set(code.co_names)) and not (path in ("sqlglot/dialects/dialect.py", "sqlglot/helper.py") and code.co_qualname in ONE_NAME)
 
 
-def owner_of(node):
+def first_name(node):
     """The name an expression such as a.b[c].d() starts from, or None."""
     while True:
         match node:
@@ -142,9 +142,9 @@ def reaches_into(node, foreign):
         case ast.Call(func=ast.Name(id="setattr" | "delattr")):
             return True
         case ast.Call(func=ast.Attribute(attr=name, value=inner)) if name in state.MUTATORS:
-            return owner_of(inner) in foreign
+            return first_name(inner) in foreign
     stored = [*getattr(node, "targets", ()), getattr(node, "target", None)]
-    return any(owner_of(target) in foreign for target in stored if isinstance(target, (ast.Subscript, ast.Attribute)))
+    return any(first_name(target) in foreign for target in stored if isinstance(target, (ast.Subscript, ast.Attribute)))
 
 
 def imports_change_others(tree):
