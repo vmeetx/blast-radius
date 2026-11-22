@@ -68,3 +68,16 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 - `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
 - The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
 - A change that only adds a comment is not promised to be harmless.
+
+## This entry
+
+`selector.py` reads a map in `map/` and answers from it. Nothing from the patches is executed. The map was recorded once at the pinned commit, in the base image with `requirements.lock`, by the programs in `build/` (`MAP_ORIGIN.json` says with what). It holds, for every test, the code objects it ran, the files it opened and the modules its test file loads.
+
+A test is left out only if its record shows that the change played no part in it:
+
+- Two versions of a Python file are compiled and compared code object by code object, line numbers aside. If only bodies that run when called differ, the tests that ran them are chosen.
+- If module- or class-level code differs, or a body that writes state which outlives a call, every test of every test file that loads the module is chosen. So is a file that no longer compiles.
+- A changed data file chooses the tests that opened it. A test file chooses its own tests.
+- Added, deleted and renamed files, settings, binary files, anything the map does not cover and any patch that does not apply exactly run every test.
+
+`app/state.py` decides what writes lasting state and errs towards yes. To rebuild the map, build `build/Dockerfile`, run `build/gather.py` in it (modes `fork`, `order` and `reverse`), then `build/pack_map_pieces.py`.

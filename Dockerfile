@@ -3,4 +3,6 @@
 # decide which sqlglot tests run, so keep it if your image runs them.
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 COPY selector.py /app/selector.py
-CMD ["python", "/app/selector.py"]
+COPY app /app/app
+COPY map /app/map
+CMD ["python", "-I", "-S", "/app/selector.py"]
