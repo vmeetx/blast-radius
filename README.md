@@ -76,7 +76,7 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 A test is left out only if its record shows that the change played no part in it:
 
 - Two versions of a Python file are compiled and compared code object by code object, line numbers aside. If only bodies that run when called differ, the tests that ran them are chosen.
-- If module- or class-level code differs, or a body that writes state which outlives a call, every test of every test file that loads the module is chosen. So is a file that no longer compiles.
+- If module- or class-level code differs, the tests that load the module are chosen: all tests of a file that loads it while it is collected, otherwise the tests that load it themselves, and every test that looks through the registry of dialects. A changed body that writes such state, and a file that no longer compiles, choose every test of every test file that loads the module.
 - A changed data file chooses the tests that opened it. A test file chooses its own tests.
 - Added, deleted and renamed files, settings, binary files, anything the map does not cover and any patch that does not apply exactly run every test.
 

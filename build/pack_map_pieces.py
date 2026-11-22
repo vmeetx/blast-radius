@@ -31,6 +31,8 @@ for row in rows:
 everyone = sum(bit.values())
 
 loaded, ran, opened, listed, session = {}, {}, {}, {}, set()
+# the same, with a module that is first loaded inside a test credited to that test alone
+loaded_by_test = {}
 untraced = 0
 problems = []
 LOOKS_AT_CODE = re.compile(r"__code__|\bco_[a-z]+|\binspect\.|getsource|\bdis\.|__wrapped__")
@@ -54,6 +56,7 @@ for folder in folders:
             for letter in "FIC":
                 credit(ran, common.get(letter, ()), owners)
             credit(loaded, common.get("M", ()), owners)
+            credit(loaded_by_test, common.get("M", ()), owners)
             credit(opened, common.get("O", ()), owners)
             credit(opened, common.get("E", ()), owners)
             credit(listed, common.get("D", ()), owners)
@@ -74,6 +77,7 @@ for folder in folders:
             credit(listed, one.get("D", ()), mask)
             # what runs while a module is imported belongs to every test of a file that imports it
             credit(loaded, one.get("M", ()), owners | mask)
+            credit(loaded_by_test, one.get("M", ()), mask)
             credit(ran, one.get("I", ()), owners | mask)
             if alone and one.get("P"):
                 # any edit to a module its children import counts, whatever of it they ran
@@ -99,6 +103,60 @@ typing_test = bit["tests/test_typing.py::TestTyping::test_no_redundant_expressio
 if not opened.get("sqlglot/typing/duckdb.py", 0) & typing_test:
     problems.append("the reading of sqlglot/typing was not seen")
 
+# A test that looks through the registry of dialects sees every dialect, whichever it loads itself.
+# Looking one name up, or registering one, is not looking through.
+REGISTRY = {"_classes", "classes", "DIALECTS", "DIALECT_MODULE_NAMES", "MODULE_BY_DIALECT", "Dialects", "__subclasses__", "modules", "getmembers", "iter_modules", "walk_packages"}
+ONE_NAME = {"_Dialect.get", "_Dialect.__getitem__", "_Dialect._try_load", "_Dialect.__new__", "Dialect.get_or_raise", "subclasses"}
+ALL_DIALECTS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")
+
+
+def looks_through(path, code):
+    if path == "sqlglot/helper.py" and code.co_qualname == "suggest_closest_match_and_fail":
+        return True
+    return bool(REGISTRY & set(code.co_names)) and not (path in ("sqlglot/dialects/dialect.py", "sqlglot/helper.py") and code.co_qualname in ONE_NAME)
+
+
+def owner_of(node):
+    """The name an expression such as a.b[c].d() starts from, or None."""
+    while True:
+        match node:
+            case ast.Attribute(value=inner) | ast.Subscript(value=inner) | ast.Call(func=inner):
+                node = inner
+            case ast.Name(id=name):
+                return name
+            case _:
+                return None
+
+
+def evaluated_at_import(tree):
+    """Every node of a module that is not inside a function."""
+    waiting = list(tree.body)
+    for node in waiting:
+        if not isinstance(node, state.INNER):
+            yield node
+            waiting += ast.iter_child_nodes(node)
+
+
+def reaches_into(node, foreign):
+    match node:
+        case ast.Call(func=ast.Name(id="setattr" | "delattr")):
+            return True
+        case ast.Call(func=ast.Attribute(attr=name, value=inner)) if name in state.MUTATORS:
+            return owner_of(inner) in foreign
+    stored = [*getattr(node, "targets", ()), getattr(node, "target", None)]
+    return any(owner_of(target) in foreign for target in stored if isinstance(target, (ast.Subscript, ast.Attribute)))
+
+
+def imports_change_others(tree):
+    """Does importing this module store into an object that another module made?"""
+    foreign = set()
+    for node in ast.walk(tree):
+        match node:
+            case ast.Import() | ast.ImportFrom():
+                foreign.update(state.names_bound_by(node))
+    return any(reaches_into(node, foreign) for node in evaluated_at_import(tree))
+
+
 pieces, index = {}, {}
 blobs = bytearray()
 
@@ -123,8 +181,24 @@ for path in paths:
 attributes = sorted(state.class_attribute_names([tree for path, tree in trees.items() if path.startswith(("sqlglot/", "tests/"))]))
 keep("class attributes", json.dumps(attributes).encode())
 hexed = lambda mask: format(mask, "x")
+guard = 0
+for path in trees:
+    if path.startswith(("sqlglot/", "tests/")):
+        for part in flatten(compile(trees[path], path, "exec", dont_inherit=True)):
+            if part.co_flags & codes.OWN_LOCALS and looks_through(path, part):
+                guard |= ran.get(f"{path}:{codes.key(part)}", 0)
+print(count(guard), "tests look through the registry of dialects")
+changers = sorted(path for path in trees if path.startswith("sqlglot/") and imports_change_others(trees[path]))
+print(len(changers), "modules change other modules when imported:", changers[:8])
 OURS = {"sqlglot", "sqlglotc", "tests", "sqlglot-integration-tests"}
 writers = total = 0
+def narrow(path):
+    whole = loaded.get(path, 0)
+    if path in changers or not path.startswith("sqlglot/"):
+        return whole
+    return whole & (loaded_by_test.get(path, 0) | (guard if path.startswith(ALL_DIALECTS) else 0))
+
+
 for path in paths:
     content = (SRC / path).read_bytes()
     top, name = path.split("/")[0], path.split("/")[-1]
@@ -135,7 +209,7 @@ for path in paths:
         "not known to be read by a test": not python and path not in opened and top in OURS,
     }
     always = next((reason for reason, applies in reasons.items() if applies), "")
-    facts = {"always": always, "opened": hexed(opened.get(path, 0)), "loaded": hexed(loaded.get(path, 0)), "codes": {}}
+    facts = {"always": always, "opened": hexed(opened.get(path, 0)), "loaded": hexed(loaded.get(path, 0)), "narrow": hexed(narrow(path)), "codes": {}}
     if b"\0" not in content:
         keep("source:" + path, content)
     if path in trees:

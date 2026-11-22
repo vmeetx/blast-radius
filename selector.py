@@ -115,7 +115,8 @@ class Chooser:
         try:
             differing = codes.changed(before, after)
         except codes.NeedLoadRule:
-            return loaders
+            # what runs at import reaches a test through the module: only tests that load it
+            return self.numbers(facts["narrow"]) | numbered | untraced
         if not differing:
             return numbered
         ran = numbered | untraced
