@@ -11,6 +11,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import types
 import zlib
 
 sys.path.insert(0, "/app")
@@ -72,24 +73,30 @@ print(len(unlike), "tests differ between the two seeds", unlike[:10])
 always = sum(bit[name] for name in first[1] | second[1])
 print(always.bit_count(), "tests without a sound record")
 pairs = {}
-for gaps, _ in (first, second):
-    for name, met in gaps.items():
-        for pair in met:
-            pairs[pair] = pairs.get(pair, 0) | bit.get(name, 0)
+for test, place in bit.items():
+    # both passes count, whichever of them met the gap
+    for pair in first[0].get(test, set()) | second[0].get(test, set()):
+        pairs.setdefault(pair, [0])[0] |= place
+pairs = {pair: total for pair, [total] in pairs.items()}
 
 
-def nested(code):
-    yield code
-    for value in code.co_consts:
-        if hasattr(value, "co_code"):
-            yield from nested(value)
+def bodies(module):
+    """The module's code object and every code object somewhere inside it."""
+    waiting, found = [module], []
+    while waiting:
+        body = waiting.pop()
+        found.append(body)
+        for constant in body.co_consts:
+            if isinstance(constant, types.CodeType):
+                waiting.append(constant)
+    return found
 
 
 # tests whose own code looks at a table or a required set
 for place in index["files"]:
     if place.startswith("tests/") and "code:" + place in index["pieces"]:
         facts = json.loads(inflate("facts:" + place))
-        for code in nested(marshal.loads(inflate("code:" + place))):
+        for code in bodies(marshal.loads(inflate("code:" + place))):
             reads = {step.argval for step in dis.get_instructions(code) if step.opname in ("LOAD_ATTR", "LOAD_SUPER_ATTR")}
             if WATCHED & (reads | {value for value in code.co_consts if isinstance(value, str)}):
                 mask = facts["codes"][codes.key(code)][0] if code.co_flags & codes.OWN_LOCALS else facts["loaded"]
@@ -136,7 +143,20 @@ print("tests that look at files of the package, most per file:", sorted(((mask.b
 print(len(classes), "classes,", len(pairs), "pairs met, by classes unknown:", strangers[:10])
 if strangers:
     sys.exit("PROBLEM gaps of classes that are not in the snapshot")
-add("gaps", {"always": format(always, "x"), "readers": {place: format(mask, "x") for place, mask in sorted(readers.items())}, "pairs": {pair: format(mask, "x") for pair, mask in sorted(pairs.items())}})
+
+
+def in_hexadecimal(masks):
+    """The same table in order of its keys, every mask written in base 16."""
+    written = {}
+    for key in sorted(masks):
+        written[key] = f"{masks[key]:x}"
+    return written
+
+
+summary = {"always": f"{always:x}"}
+for title, masks in (("readers", readers), ("pairs", pairs)):
+    summary[title] = in_hexadecimal(masks)
+add("gaps", summary)
 add("requirements", {"pin": flags.PIN, "hash": flags.digest(classes), "modules": bare, "classes": classes})
 
 (out / "pieces.bin").write_bytes(bytes(blobs))

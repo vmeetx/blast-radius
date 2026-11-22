@@ -11,6 +11,7 @@ import select
 import signal
 import sys
 import zlib
+from time import monotonic
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "app"))
@@ -20,6 +21,7 @@ import worker_piles  # noqa: E402
 FORMAT = 1
 LARGEST = 1000000
 STALLED = 2
+BEGAN = monotonic()
 HELPERS = 5
 NOT_PYTHON = (LookupError, MemoryError, RecursionError, SyntaxError, ValueError)
 TEST_HEADER = re.compile(rb"^[ \t]*(?:(?:async[ \t]+)?def[ \t]+test|class[ \t]+Test)[^\r\n]*", re.M)
@@ -142,7 +144,7 @@ class Chooser:
         if self.coarse:
             import requirement_flags
 
-            gate = requirement_flags.Gate(self.record, programs)
+            gate = requirement_flags.Gate(self.record, programs, BEGAN)
             for path, loaders in self.coarse.items():
                 mask = gate.observers(path)
                 wanted |= loaders if mask is None else loaders & self.numbers(format(mask, "x"))
@@ -194,7 +196,7 @@ def line(name, workers):
 
 
 def helped(names, decide, full):
-    """The lines a forked helper wrote for these commits, in order: fewer than asked if it was killed."""
+    """Has a forked helper write the lines for these commits, in order. Tells how many: fewer than asked if it was killed."""
     source, sink = os.pipe()
     sys.stderr.flush()
     helper = os.fork()
@@ -221,16 +223,19 @@ def helped(names, decide, full):
         finally:
             os._exit(1)
     os.close(sink)
-    told, piece = b"", None
+    told, piece, count = b"", None, 0
     # the parent watches too: a helper that says nothing for this long is ended, whatever it is stuck on
     while piece != b"" and any(select.select([source], [], [], STALLED * 3)):
         piece = os.read(source, 1 << 16)
-        told += piece
+        # what is decided is printed at once; a line cut short by a dying helper never is
+        whole, end, told = (told + piece).rpartition(b"\n")
+        count += (whole + end).count(b"\n")
+        sys.stdout.write((whole + end).decode())
+        sys.stdout.flush()
     os.kill(helper, signal.SIGKILL)
     os.close(source)
     os.waitpid(helper, 0)
-    # the last piece is cut short if the helper died while writing it
-    return [part for part in told.decode(errors="replace").splitlines(keepends=True) if part.endswith("\n")]
+    return count
 
 
 def numbered_tests(data, record):
@@ -280,15 +285,14 @@ def main():
 
     lost = 0
     while names:
-        lines = helped(names, decide, full) if lost < HELPERS else []
+        names = names[helped(names, decide, full) if lost < HELPERS else 0:]
         # a helper that died left the next commit without a line: that one runs everything, the rest get a new helper
         # (after a few lost helpers, the rest run everything)
-        if len(lines) < len(names):
+        if names:
             lost += 1
-            lines.append(line(names[len(lines)], full))
-        sys.stdout.writelines(lines)
-        sys.stdout.flush()
-        names = names[len(lines):]
+            sys.stdout.write(line(names[0], full))
+            sys.stdout.flush()
+            names = names[1:]
 
 
 if __name__ == "__main__":

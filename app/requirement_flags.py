@@ -14,12 +14,16 @@ import os
 import select
 import signal
 import sys
+import time
 
 PIN = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 TABLE = "arg_types"
 BASE = ("sqlglot.expressions.core", "Expr")
 SECONDS = 4
-slow = []
+# no child imports once the batch has taken this long
+BATCH = 90
+RAISED = 3
+lost = []
 
 
 class Shelf:
@@ -65,48 +69,82 @@ def describe(modules):
 
 
 def digest(table):
-    return hashlib.sha256(json.dumps(table, sort_keys=True).encode()).hexdigest()
+    stamp = hashlib.sha256()
+    for part in json.JSONEncoder(sort_keys=True).iterencode(table):
+        stamp.update(part.encode("ascii"))
+    return stamp.hexdigest()
+
+
+def in_child(sink, record, replaced, modules):
+    """Import, answer, end. 0: answered, 3: the package raised something; any other end counts as a death."""
+    try:
+        signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        signal.alarm(SECONDS + 1)
+        nowhere = os.open(os.devnull, os.O_RDWR)
+        for stream in range(3):
+            os.dup2(nowhere, stream)
+        sys.meta_path.insert(0, Shelf(record, replaced))
+        try:
+            answer = json.dumps(describe(modules))
+        except MemoryError:
+            os._exit(1)
+        except Exception:
+            os._exit(RAISED)
+        with open(sink, "w", encoding="utf-8") as told:
+            told.write(answer)
+        os._exit(0)
+    finally:
+        os._exit(1)
+
+
+def everything_said(source, limit):
+    """What comes through the pipe until it is closed, or None once the limit has passed."""
+    heard = bytearray()
+    while select.select([source], [], [], max(limit - time.monotonic(), 0))[0]:
+        piece = os.read(source, 1 << 20)
+        if not piece:
+            return bytes(heard)
+        heard += piece
+
+
+def ending(child, limit):
+    """How the child ended; it is killed at the limit."""
+    while time.monotonic() < limit:
+        gone, status = os.waitpid(child, os.WNOHANG)
+        if gone:
+            return status
+        time.sleep(0.005)
+    os.kill(child, signal.SIGKILL)
+    return os.waitpid(child, 0)[1]
 
 
 def measured(record, replaced, modules):
-    """What describe() says of the patched package, or None if it cannot be imported in time."""
+    """What describe() says of the patched package, or None. A child that dies or is late ends the measuring for good."""
+    # one limit for the whole child, however it spends its time; shorter than its own alarm
+    limit = time.monotonic() + SECONDS
     source, sink = os.pipe()
     child = os.fork()
     if not child:
-        try:
-            # whatever happens here ends here
-            signal.setitimer(signal.ITIMER_VIRTUAL, 0)
-            signal.signal(signal.SIGALRM, signal.SIG_DFL)
-            signal.alarm(SECONDS + 1)
-            nowhere = os.open(os.devnull, os.O_RDWR)
-            for stream in range(3):
-                os.dup2(nowhere, stream)
-            sys.meta_path.insert(0, Shelf(record, replaced))
-            with open(sink, "w", encoding="utf-8") as told:
-                json.dump(describe(modules), told)
-            os._exit(0)
-        finally:
-            os._exit(1)
+        in_child(sink, record, replaced, modules)
     os.close(sink)
-    heard, piece = b"", None
     # the alarm for a stalled commit waits; the parent process still watches
     left = signal.alarm(0)
+    answer = status = None
     try:
-        while piece != b"":
-            ready, _, _ = select.select([source], [], [], SECONDS)
-            if not ready:
-                # not again in this batch
-                print("the child import took too long:", *replaced, file=sys.stderr)
-                slow.append(True)
-                return None
-            piece = os.read(source, 1 << 20)
-            heard += piece
+        answer = everything_said(source, limit)
+        status = ending(child, limit if answer is not None else 0)
+        if answer is not None and os.waitstatus_to_exitcode(status) == 0:
+            return json.loads(answer)
+    except ValueError:
+        status = None
     finally:
-        os.kill(child, signal.SIGKILL)
-        _, status = os.waitpid(child, 0)
         os.close(source)
         signal.alarm(left)
-    return json.loads(heard) if heard.endswith(b"}") else None
+    if answer is None or status is None or os.waitstatus_to_exitcode(status) != RAISED:
+        print("no more child imports after:", *replaced, file=sys.stderr)
+        lost.append(child)
+    return None
 
 
 def without_flags(tree, module, classes):
@@ -135,7 +173,8 @@ def only_flips(path, old, new, classes):
 class Gate:
     """The answers for one patch; files is {path: (old bytes, new bytes)} of its Python files."""
 
-    def __init__(self, record, files):
+    def __init__(self, record, files, began):
+        self.began = began
         self.record, self.files, self.known, self.mask = record, files, None, None
         if record.index["pieces"].get("requirements") is None:
             return
@@ -143,9 +182,13 @@ class Gate:
         if known["pin"] == PIN and known["hash"] == digest(known["classes"]):
             self.known = known
 
+    def closed(self):
+        """Are child imports over for this batch?"""
+        return bool(lost) or time.monotonic() - self.began > BATCH
+
     def observers(self, path):
         """Mask of the tests that may notice this file's change, or None if it is not for us to say."""
-        if slow or not self.known or not path.startswith("sqlglot/"):
+        if self.closed() or not self.known or not path.startswith("sqlglot/"):
             return None
         old, new = self.files[path]
         if not only_flips(path, old, new, self.known["classes"]):
