@@ -27,7 +27,10 @@ def class_attribute_names(trees):
 
 
 def _names_in(target):
-    return {part.id for part in ast.walk(target) if isinstance(part, ast.Name)}
+    for part in ast.walk(target):
+        match part:
+            case ast.Name(id=name):
+                yield name
 
 
 def _given_a_value(statement):
@@ -39,7 +42,7 @@ def _given_a_value(statement):
     return []
 
 
-def _names_bound_by(node):
+def names_bound_by(node):
     """Names this one node binds in the scope it stands in."""
     match node:
         case ast.arg(arg=name) | ast.Name(id=name, ctx=ast.Store() | ast.Del()) | ast.ExceptHandler(name=str(name)):
@@ -55,7 +58,7 @@ def _bound_names(function):
     """Names local to the function or to a function nested in it."""
     within = iter(ast.walk(function))
     next(within)
-    return {name for node in within for name in _names_bound_by(node)}
+    return {name for node in within for name in names_bound_by(node)}
 
 
 def _defines(node):
@@ -95,7 +98,7 @@ def writes_state(function, class_attributes):
         return True
     local = _bound_names(function)
     imports = [part for part in parts if isinstance(part, (ast.ImportFrom, ast.Import))]
-    imported = set().union(*(_names_bound_by(part) for part in imports))
+    imported = set().union(*(names_bound_by(part) for part in imports))
     lasting = set()
 
     def outlives(node):
@@ -120,7 +123,7 @@ def writes_state(function, class_attributes):
         for target, value in _given_names(part):
             # a plain call or a fresh literal makes a new object; a bare global function or class is not data
             if isinstance(value, MAY_NAME_AN_OLD_OBJECT) and outlives(value):
-                lasting |= _names_in(target)
+                lasting.update(_names_in(target))
 
     def stores(target):
         match target:
