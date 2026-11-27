@@ -1,4 +1,4 @@
-IMAGE ?= blast-radius-entry
+IMAGE ?= blast-radius
 SAMPLE := $(CURDIR)/sample
 OUTPUT := $(CURDIR)/output.jsonl
 

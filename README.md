@@ -1,84 +1,91 @@
-# Blast Radius starter
+# blast-radius
 
-A working submission for the Blast Radius track. It runs every test on every commit, so it never misses a failure and scores badly. Your job is to run less without missing.
+**Run only the Python tests a change could have affected, and know why the rest were skipped.** blast-radius traces every test once against a base commit. When a code change comes in, it compiles the old and new files and compares them function by function. It then picks only the tests that actually ran something that changed, and splits them across parallel workers so the batch finishes soonest. It is built for workloads that make many changes against one fixed base: AI coding agents working in a checkout, mutation testing, and replaying commits for research.
 
-## The problem
+Built for RWX's Blast Radius track at Builders Buildathon 2026. The task was to choose which of [sqlglot](https://github.com/tobymao/sqlglot)'s 1,620 tests to run for each code change, without missing a failing test. This repository keeps that entry's full history and grows it into a standalone tool. MIT licensed.
 
-Your image gets a batch of code changes to [sqlglot](https://github.com/tobymao/sqlglot) at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. For each change, print which tests to run and how to split them across up to 8 workers.
+**Limits:**
+- The map must be rebuilt for each base commit, and a change must apply exactly to that base.
+- The map only works with the exact Python build it was recorded on (3.13).
+- It runs on Linux and macOS only.
+- Skipping a test is safe only if your tests are deterministic and don't depend on state left by other tests.
 
-| | |
-| --- | --- |
-| `/data/commits/<id>.patch` | One unified diff against the pinned commit. Each stands alone: none builds on another. |
-| `/data/tests.json` | Every test, numbered, with its file and the seconds it took us to run. |
-| stdout | One JSON line a commit: `{"commit": "k7q2", "workers": [[12, 845, 901], [3, 77]]}` |
+## Results (sqlglot at `eb11aec`, 1,620 tests)
 
-Each inner list is one worker's test numbers. `"workers": []` runs nothing, which is the right answer for a change that breaks nothing.
+| | All tests | blast-radius |
+|---|---|---|
+| Simulated test time, 30 sample changes | 1,104.5 s | **188.0 s (83% less)** |
+| Missed failures, 30 sample changes | 0 | **0** |
+| Missed failures, about 130 labelled changes | n/a | **0** (miss rate under about 2.5% per change at 95% confidence, by the rule of three) |
 
-## Scoring
+- **Simulated time:** for each change, the busiest worker's recorded test seconds plus 2 s per worker, as defined in [SCORING.md](SCORING.md). It is not wall-clock time.
+- **Labelled changes:** real upstream commits, the samples, and generated mutants.
+- **Selector cost:** about 2 s of CPU for a batch.
+- **Robustness:** it always printed a valid answer under injected crashes, hangs, memory exhaustion, truncated output and stalled child processes.
 
-Lower is better. [SCORING.md](SCORING.md) has the exact rules; in short:
+To reproduce: `make sample` (needs Docker, make and Python 3.9+).
 
-- A commit costs the recorded seconds of its busiest worker, plus 2 seconds for every worker.
-- A commit where you left out a test that fails adds 300 seconds.
-- The CPU seconds your program uses are added. Running sqlglot's tests while you decide is allowed, and you pay for the time.
-- Your image runs 3 times and the middle total counts.
+## How it decides
 
-"Fails" means pytest reports a failure, an error or a timeout for the test, or the test's file cannot be imported. A test with subtests is one test: one failing subtest fails it.
+- **The map (built once per base commit).** Each test runs in its own forked process, traced with `sys.monitoring`. The map records, per test:
+  - the code objects it entered;
+  - the files it opened, listed or checked for;
+  - the modules its test file loads;
+  - whether it started child processes.
+- **Function-body changes.** If only function bodies changed, the tests that ran those bodies are chosen. Line-number shifts change nothing.
+- **Module- or class-level changes.** The tests that load that module are chosen. A changed body that writes lasting state, or a file that no longer compiles, chooses every test of every test file that loads the module.
+- **Flag-only changes (sqlglot-specific).** If a change only flips true/false entries in sqlglot's `arg_types` tables, the patched package is imported in a forked child process.
+  - The child has one 4 s deadline. Only the tests that validated a class without one of the changed arguments are chosen.
+  - A child that dies or is late turns this path off for the rest of the batch, and no child starts after 90 s.
+  - **This path runs the patched code.**
+- **Anything uncertain runs everything:** settings files, renames, binary files, added or removed tests, patches that don't apply exactly, and anything the map doesn't cover.
 
-## Try it
+`app/state.py` decides what writes lasting state, and errs towards yes.
 
-You need Docker, make and Python 3.9 or newer. The kit unpacks into the folder you are in, so unpack it into an empty one.
+## Use it
 
 ```sh
-make sample   # build, run once on the 30 sample commits under the scorer's limits, and score
-make check    # the output's format only
+docker build -t blast-radius .
+# data/commits/*.patch: unified diffs against the mapped base
+# data/tests.json: {"tests": [{"id": ..., "number": ..., "file": ..., "seconds": ...}]}
+docker run --rm --network none -v "$PWD/data:/data:ro" blast-radius
 ```
 
-`make sample` prints your simulated seconds and misses, which are exact for that output. The board adds the CPU seconds your container used and takes the middle of 3 runs, so expect it a little higher. Your program never sees `sample/answers.json`: only the patches and `tests.json` are mounted.
+The output is one JSON line per change: `{"commit": "<name>", "workers": [[test numbers], ...]}`, with up to 8 workers. Lines are printed as soon as each change is decided. `BLAST_RADIUS_DATA` changes the data folder.
 
-`sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
+**Rebuilding the map:**
+1. Build `build/Dockerfile`.
+2. Run `build/gather.py` in modes `fork`, `order` and `reverse`.
+3. Run `build/pack_map_pieces.py`.
+4. Run `build/pack_gaps.py` with the fork passes of hash seeds 0 and 1.
 
-## Submit
+`map/MAP_ORIGIN.json` records what the map was built from.
 
-Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.
+## Repository layout
 
-## Rules
+| Path | What it is |
+|---|---|
+| `selector.py`, `app/` | The selector: diff reading, code-object comparison, state rules, the flag gate, worker packing |
+| `build/` | The map builder: the per-test tracer, session runner and packers |
+| `map/` | The example map for sqlglot at `eb11aec` |
+| `Makefile`, `score.py`, `SCORING.md`, `sample/` | The track's benchmark kit: 30 sample changes with known failing tests, and the scorer |
+| `docs/POSITIONING.md` | Who needs a tool like this and how it compares with the alternatives, with sources |
+| `docs/RESEARCH_PROMPT*.md` | The research prompt behind that document, and the critical review that rewrote it |
 
-- Submit your own team's repository. A submission with the same repository, commit or archive as another team's is disqualified, the later one.
-- Your build may download only from public package registries: PyPI, npm, Docker Hub, GitHub releases at a fixed tag, and sqlglot’s own repository at the pinned commit. Nothing from an address your team controls. The final rebuilds every image after the cutoff, so anything else could change a submission after the deadline.
-- No answers worked out ahead of time and looked up by patch: no table from a patch, or from a kind of edit, to the tests it breaks. Maps built from the pinned commit (coverage, imports, fixtures) are allowed. Top entries are read.
-- Only the final counts. The practice board carries no prize.
+## Roadmap (what blocks general use, most important first)
 
-## How your image runs
+1. A pytest node-id interface: accept a diff and print node ids, with no numbered test list needed.
+2. A generic map builder for any repository, with the sqlglot flag gate as an optional plugin.
+3. An added test selects itself plus the normal rules, instead of everything.
+4. Base drift: handle a diff made against a newer commit, or update the map incrementally.
+5. Maps and measurements for more repositories, including one with a heavy shared core.
+6. Wall-clock and CPU comparisons against pytest-testmon and coverage-based selection.
 
-- The build has the network, 4 cores, 8 GB of memory and 10 minutes. It may clone sqlglot at the pinned commit, install it and run its tests to make coverage or import maps.
-- Your repository may hold 20 MB. Git submodules and Git LFS files are not fetched: clone sqlglot in the `Dockerfile` and commit maps as plain files.
-- The run has no network, 2 cores, 4 GB of memory and 3 minutes for the whole batch (4.5 in the final, which has about one and a half times as many commits).
-- The disk is read-only. `/tmp` holds 64 MB and is empty at the start of every run.
-- The container runs as user `nobody`, with `HOME=/tmp` and at most 256 processes.
-- stdout may hold 2 MB. More rejects the run.
+## How it compares
 
-## Things that will catch you
+- **[pytest-testmon](https://pypi.org/project/pytest-testmon):** coverage blocks with an incremental local database. It is better for a developer's local loop on a moving branch.
+- **Hosted test impact analysis services:** select by covered files and history, need a network connection, and by their own documentation can skip tests when data files or dependencies change.
+- **Predictive (ML) selection:** trades a known share of missed failures for speed.
+- **Line-level coverage selection:** a Python study found it missed 16–24% of faults.
 
-- Logs go to stderr. Any line on stdout that is not an answer rejects the run.
-- `score.py` names a broken rule by its code, as in `Rejected: not_json on line 1`. The table in SCORING.md says what each code means.
-- Files your program needs must be readable by `nobody`. A map written by `root` during the build with mode 600 is not.
-- pytest 9 prints a test as `PASSED` beside `SUBFAILED` lines when one of its subtests fails. That test failed.
-- sqlglot skips its executor tests unless `SKIP_INTEGRATION=0` is set. We labeled with it set, so those tests can fail.
-- `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
-- The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
-- A change that only adds a comment is not promised to be harmless.
-
-## This entry
-
-`selector.py` reads a map in `map/` and answers from it. Nothing from the patches is executed, except that a patch which may only flip requirement flags is imported in a forked process (next list). The map was recorded once at the pinned commit, in the base image with `requirements.lock`, by the programs in `build/` (`MAP_ORIGIN.json` says with what). It holds, for every test, the code objects it ran, the files it opened and the modules its test file loads.
-
-A test is left out only if its record shows that the change played no part in it:
-
-- Two versions of a Python file are compiled and compared code object by code object, line numbers aside. If only bodies that run when called differ, the tests that ran them are chosen.
-- If module- or class-level code differs, the tests that load the module are chosen: all tests of a file that loads it while it is collected, otherwise the tests that load it themselves, and every test that looks through the registry of dialects. A changed body that writes such state, and a file that no longer compiles, choose every test of every test file that loads the module.
-- If the only change to a module is true/false flags of `arg_types` entries of expression classes, the package is imported with the whole patch, from the map, in a forked process with its output closed. The classes whose required arguments then differ are known, and of the tests above only those are chosen that validated such a class without that argument, or that read the file. `build/gap_facts.py` records those gaps under two hash seeds, and `app/requirement_flags.py` refuses whenever anything else differs.
-- A changed data file chooses the tests that opened it. A test file chooses its own tests.
-- Added, deleted and renamed files, settings, binary files, anything the map does not cover and any patch that does not apply exactly run every test.
-
-`app/state.py` decides what writes lasting state and errs towards yes. To rebuild the map, build `build/Dockerfile`, run `build/gather.py` in it (modes `fork`, `order` and `reverse`), then `build/pack_map_pieces.py`, then `build/pack_gaps.py` with the fork passes of hash seeds 0 and 1.
+blast-radius sits between file-level and line-level selection: safe under its assumptions, finer than files, and offline. [docs/POSITIONING.md](docs/POSITIONING.md) has the details and sources.
